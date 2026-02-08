@@ -30,7 +30,7 @@ bpm_history = []  # Stores {"timestamp": ..., "bpm": ...}
 start_time = None  # Track when monitoring started
 
 # --- Wake-up Alert & Sleep Detection ---
-awake = True  # DEMO MODE: Set to True to trigger alarm immediately
+awake = False  # DEMO MODE: Set to True to trigger alarm immediately
 
 baseline_bpm = None  # Average BPM from first 10 readings
 sleep_stage = "awake"  # "awake", "falling_asleep", "deep_sleep"
