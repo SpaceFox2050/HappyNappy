@@ -60,18 +60,33 @@ int buttonpadReadingValue;
 const int buttonPadPin = 12;
 const int readingTolerance = 60;
 
+//joystick info (using separated ADC1 channels)
+const int joystickPinX = 32;  // ADC1_CH4
+const int joyStickPinY = 27;  // ADC1_CH7 (separated by 3 channels from X)
+int joystickReadingX;
+int joystickReadingY;
+
+
 // Vibration motor
 static const uint8_t kVibePin = 25;
+static const uint8_t kSpeakerPin = 26;
+static const uint8_t kSpeakerChannel = 0;
+static const uint16_t kSpeakerFreq = 2000;
 static const uint16_t kSnoozeMinutes = 5;
 
 // Menu state
 enum class Screen {
   Dashboard,
   MainMenu,
+  ViewAlarm,
   SetAlarm,
+  SetAlarmType,
   SmartAlarm,
+  SmartAlarmInfo,
   SystemSettingsMenu,
+  AlarmOutput,
   SystemTone,
+  TestAlarmOutput,
   Alert
 };
 
@@ -91,14 +106,23 @@ Screen currentScreen = Screen::Dashboard;
 uint8_t mainMenuIndex = 0;
 uint8_t alertMenuIndex = 0;
 uint8_t systemMenuIndex = 0;
+uint8_t smartAlarmMenuIndex = 0;
+uint8_t alarmOutputIndex = 0;
 uint8_t alarmToneIndex = 0;
 uint8_t setAlarmFieldIndex = 0;
+uint8_t setAlarmTypeIndex = 0;
 bool alarmEnabled = true;
 uint16_t alarmYear = 2026;
 uint8_t alarmMonth = 1;
 uint8_t alarmDay = 1;
 uint8_t alarmHour = kAlarmHour;
 uint8_t alarmMinute = kAlarmMinute;
+uint8_t alarmType = 0;        // 0 = Normal, 1 = Max Sleep, 2 = Smart Sleep
+uint8_t alarmOutput = 0;      // 0 = Vibration, 1 = Speaker, 2 = Both
+bool showSmartAlarmInfo = false;
+bool showAlarmTypeInfo = false;
+bool testAlarmPlaying = false;
+uint32_t testAlarmStartMs = 0;
 
 // Vibration pattern state
 struct VibeState {
@@ -168,6 +192,24 @@ std::string buttonpadReading(int reading){
   return pressed;
 }
 
+//reading the joystick for menu control
+std::string joystickReading(int x, int y) {
+  string pressed = "nopress";
+  
+  // Only one direction at a time, check in priority order
+  if (x > 4000) {
+    pressed = "left";
+  } else if (x < 50) {
+    pressed = "right";
+  } else if (y > 4000) {
+    pressed = "up";
+  } else if (y < 50) {
+    pressed = "down";
+  }
+  
+  return pressed;
+}
+
 static Button ToButton(const std::string &value) {
   if (value == "up") return Button::Up;
   if (value == "down") return Button::Down;
@@ -186,6 +228,26 @@ static Button ReadButtonEvent(uint32_t nowMs) {
 
   buttonpadReadingValue = analogRead(buttonPadPin);
   std::string valueRead = buttonpadReading(buttonpadReadingValue);
+
+  if (valueRead == "nopress") {
+    lastValue = valueRead;
+    return Button::None;
+  }
+
+  if (valueRead != lastValue && (nowMs - lastChangeMs) > 180) {
+    lastValue = valueRead;
+    lastChangeMs = nowMs;
+    return ToButton(valueRead);
+  }
+
+  return Button::None;
+}
+
+static Button ReadJoystickEvent(uint32_t nowMs) {
+  static std::string lastValue = "nopress";
+  static uint32_t lastChangeMs = 0;
+
+  std::string valueRead = joystickReading(joystickReadingX, joystickReadingY);
 
   if (valueRead == "nopress") {
     lastValue = valueRead;
@@ -221,7 +283,7 @@ static void UpdateVibration(uint32_t nowMs) {
 
   const uint16_t pattern0[] = {200, 200, 200, 800};
   const uint16_t pattern1[] = {400, 200, 400, 200, 400, 800};
-  const uint16_t pattern2[] = {800, 400};
+  const uint16_t pattern2[] = {400, 400, 400, 800};
 
   const uint16_t *pattern = pattern0;
   uint8_t length = 4;
@@ -285,8 +347,24 @@ void setup() {
 
   //initialize button pad
   pinMode(buttonPadPin, INPUT);
+
+  //initialize vibration motor
   pinMode(kVibePin, OUTPUT);
   digitalWrite(kVibePin, LOW);
+
+  //initialize speaker
+  ledcSetup(kSpeakerChannel, kSpeakerFreq, 8);
+  ledcAttachPin(kSpeakerPin, kSpeakerChannel);
+  ledcWriteTone(kSpeakerChannel, 0);
+
+  //initialize joystick
+  pinMode(joystickPinX, INPUT);
+  pinMode(joyStickPinY, INPUT);
+  
+  // Configure ADC for joystick pins
+  analogSetAttenuation(ADC_11db);  // Full 0-3.3V range
+  analogReadResolution(12);         // 12-bit resolution (0-4095)
+
 
   //initialize max30102 heart rate sensor
   if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
@@ -329,8 +407,60 @@ void loop() {
   static uint32_t lastTimeMs = 0;
   const uint32_t nowMs = millis();
 
+  // Read ADC with multiple samples and validation
+  int x_sum = 0;
+  int y_sum = 0;
+  const int samples = 8;
+  
+  for (int i = 0; i < samples; i++) {
+    // Read X axis with settling
+    analogRead(joystickPinX);  // Dummy read
+    delayMicroseconds(250);
+    x_sum += analogRead(joystickPinX);
+    delayMicroseconds(100);
+    
+    // Read Y axis with settling  
+    analogRead(joyStickPinY);  // Dummy read
+    delayMicroseconds(250);
+    y_sum += analogRead(joyStickPinY);
+    delayMicroseconds(100);
+  }
+  
+  int raw_x = x_sum / samples;
+  int raw_y = y_sum / samples;
+  
+  // Filter out ADC crosstalk - when one axis is at extreme, other gets pulled up
+  const int nearMax = 3800;
+  const int crossTalkThreshold = 3000;  // If other axis also above this, likely crosstalk
+  
+  // If X is at max but Y is suspiciously high (crosstalk), correct Y
+  if (raw_x > nearMax && raw_y > crossTalkThreshold && raw_y < nearMax) {
+    raw_y = 2048;  // Reset Y to center
+  }
+  // If Y is at max but X is suspiciously high (crosstalk), correct X
+  else if (raw_y > nearMax && raw_x > crossTalkThreshold && raw_x < nearMax) {
+    raw_x = 2048;  // Reset X to center
+  }
+  // If both are at max, keep the more extreme one
+  else if (raw_x > nearMax && raw_y > nearMax) {
+    if (raw_x > raw_y) {
+      raw_y = 2048;
+    } else {
+      raw_x = 2048;
+    }
+  }
+  
+  joystickReadingX = raw_x;
+  joystickReadingY = raw_y;
+  
+  // Serial.print("X: ");
+  // Serial.print(joystickReadingX);
+  // Serial.print(" Y: ");
+  // Serial.println(joystickReadingY);
+  //delay(200);
+
   UpdateVibration(nowMs);
-  Button button = ReadButtonEvent(nowMs);
+  Button button = ReadJoystickEvent(nowMs);
 
   RtcDateTime now = rtc.GetDateTime();
   const bool timeValid = rtc.IsDateTimeValid();
@@ -352,7 +482,7 @@ void loop() {
     case Screen::MainMenu:
       if (button == Button::Up && mainMenuIndex > 0) {
         mainMenuIndex--;
-      } else if (button == Button::Down && mainMenuIndex < 3) {
+      } else if (button == Button::Down && mainMenuIndex < 4) {
         mainMenuIndex++;
       } else if (button == Button::Right) {
         if (mainMenuIndex == 0) {
@@ -362,19 +492,27 @@ void loop() {
             StopVibration();
           }
         } else if (mainMenuIndex == 1) {
+          currentScreen = Screen::ViewAlarm;
+        } else if (mainMenuIndex == 2) {
           if (timeValid) {
             SetAlarmDefaultsFromNow(now);
           }
           setAlarmFieldIndex = 0;
           currentScreen = Screen::SetAlarm;
-        } else if (mainMenuIndex == 2) {
-          currentScreen = Screen::SmartAlarm;
         } else if (mainMenuIndex == 3) {
+          setAlarmTypeIndex = alarmType;
+          currentScreen = Screen::SetAlarmType;
+        } else if (mainMenuIndex == 4) {
           systemMenuIndex = 0;
           currentScreen = Screen::SystemSettingsMenu;
         }
       } else if (button == Button::Left) {
         currentScreen = Screen::Dashboard;
+      }
+      break;
+    case Screen::ViewAlarm:
+      if (button == Button::Left) {
+        currentScreen = Screen::MainMenu;
       }
       break;
     case Screen::SetAlarm:
@@ -410,26 +548,89 @@ void loop() {
           currentScreen = Screen::MainMenu;
         }
       } else if (button == Button::Left) {
+        SetAlarmFromFields();
+        currentScreen = Screen::MainMenu;
+      }
+      break;
+    case Screen::SetAlarmType:
+      if (button == Button::Up && setAlarmTypeIndex > 0) {
+        setAlarmTypeIndex--;
+        showAlarmTypeInfo = false;
+      } else if (button == Button::Down && setAlarmTypeIndex < 2) {
+        setAlarmTypeIndex++;
+        showAlarmTypeInfo = false;
+      } else if (button == Button::Right) {
+        if (showAlarmTypeInfo) {
+          alarmType = setAlarmTypeIndex;
+          currentScreen = Screen::MainMenu;
+        } else {
+          showAlarmTypeInfo = true;
+        }
+      } else if (button == Button::Left) {
+        if (showAlarmTypeInfo) {
+          showAlarmTypeInfo = false;
+        } else {
+          currentScreen = Screen::MainMenu;
+        }
         currentScreen = Screen::MainMenu;
       }
       break;
     case Screen::SmartAlarm:
+      if (button == Button::Up && smartAlarmMenuIndex > 0) {
+        smartAlarmMenuIndex--;
+        showSmartAlarmInfo = false;
+      } else if (button == Button::Down && smartAlarmMenuIndex < 1) {
+        smartAlarmMenuIndex++;
+        showSmartAlarmInfo = false;
+      } else if (button == Button::Right) {
+        if (showSmartAlarmInfo) {
+          showSmartAlarmInfo = false;
+        } else {
+          showSmartAlarmInfo = true;
+        }
+      } else if (button == Button::Left) {
+        if (showSmartAlarmInfo) {
+          showSmartAlarmInfo = false;
+        } else {
+          currentScreen = Screen::MainMenu;
+        }
+      }
+      break;
+    case Screen::SmartAlarmInfo:
       if (button == Button::Left) {
-        currentScreen = Screen::MainMenu;
+        currentScreen = Screen::SmartAlarm;
       }
       break;
     case Screen::SystemSettingsMenu:
       if (button == Button::Up && systemMenuIndex > 0) {
         systemMenuIndex--;
-      } else if (button == Button::Down && systemMenuIndex < 1) {
+      } else if (button == Button::Down && systemMenuIndex < 2) {
         systemMenuIndex++;
       } else if (button == Button::Right) {
         if (systemMenuIndex == 0) {
           currentScreen = Screen::SystemTone;
           lastTonePreview = 255;
+        } else if (systemMenuIndex == 1) {
+          currentScreen = Screen::AlarmOutput;
+          alarmOutputIndex = alarmOutput;
+        } else if (systemMenuIndex == 2) {
+          currentScreen = Screen::TestAlarmOutput;
+          testAlarmPlaying = false;
         }
       } else if (button == Button::Left) {
         currentScreen = Screen::MainMenu;
+      }
+      break;
+    case Screen::AlarmOutput:
+      if (button == Button::Up && alarmOutputIndex > 0) {
+        alarmOutputIndex--;
+      } else if (button == Button::Down && alarmOutputIndex < 2) {
+        alarmOutputIndex++;
+      } else if (button == Button::Right) {
+        alarmOutput = alarmOutputIndex;
+        currentScreen = Screen::SystemSettingsMenu;
+      } else if (button == Button::Left) {
+        currentScreen = Screen::SystemSettingsMenu;
       }
       break;
     case Screen::SystemTone:
@@ -443,6 +644,31 @@ void loop() {
       if (alarmToneIndex != lastTonePreview) {
         lastTonePreview = alarmToneIndex;
         StartVibrationPattern(alarmToneIndex, false);
+      }
+      break;
+    case Screen::TestAlarmOutput:
+      if (button == Button::Right && !testAlarmPlaying) {
+        testAlarmPlaying = true;
+        testAlarmStartMs = nowMs;
+        if (alarmOutput == 0 || alarmOutput == 2) {
+          StartVibrationPattern(alarmToneIndex, false);
+        }
+        if (alarmOutput == 1 || alarmOutput == 2) {
+          ledcWriteTone(kSpeakerChannel, kSpeakerFreq);
+        }
+      } else if (button == Button::Left) {
+        testAlarmPlaying = false;
+        StopVibration();
+        ledcWriteTone(kSpeakerChannel, 0);
+        currentScreen = Screen::SystemSettingsMenu;
+      }
+      if (testAlarmPlaying && (alarmOutput == 1 || alarmOutput == 2)) {
+        if (nowMs - testAlarmStartMs < 500) {
+          ledcWriteTone(kSpeakerChannel, kSpeakerFreq);
+        } else {
+          ledcWriteTone(kSpeakerChannel, 0);
+          testAlarmPlaying = false;
+        }
       }
       break;
     case Screen::Alert:
@@ -552,34 +778,33 @@ void loop() {
     if (currentScreen == Screen::Dashboard) {
       if (timeValid) {
         display.setTextSize(2);
-        display.setCursor(10, 10);
         char timeStr[10];
         snprintf(timeStr, sizeof(timeStr), "%02u:%02u:%02u",
                  now.Hour(), now.Minute(), now.Second());
-        display.println(timeStr);
+        DrawCenteredText(timeStr, 8, 2);
 
         display.setTextSize(1);
-        display.setCursor(10, 35);
         char dateStr[12];
         snprintf(dateStr, sizeof(dateStr), "%04u-%02u-%02u",
                  now.Year(), now.Month(), now.Day());
-        display.println(dateStr);
+        DrawCenteredText(dateStr, 30, 1);
       }
 
       display.setTextSize(1);
-      display.setCursor(0, 50);
-      display.print("HR:");
-      if (validHeartRate) {
-        display.print(heartRate);
+      char vitalStr[20];
+      if (validHeartRate && validSpo2) {
+        snprintf(vitalStr, sizeof(vitalStr), "HR:%d  SpO2:%d %%",
+                 heartRate, spo2);
+      } else if (validHeartRate) {
+        snprintf(vitalStr, sizeof(vitalStr), "HR:%d  SpO2:--",
+                 heartRate);
+      } else if (validSpo2) {
+        snprintf(vitalStr, sizeof(vitalStr), "HR:--  SpO2:%d %%",
+                 spo2);
       } else {
-        display.print("--");
+        snprintf(vitalStr, sizeof(vitalStr), "HR:--  SpO2:--");
       }
-      display.print(" SpO2:");
-      if (validSpo2) {
-        display.print(spo2);
-      } else {
-        display.print("--");
-      }
+      DrawCenteredText(vitalStr, 50, 1);
     } else if (currentScreen == Screen::MainMenu) {
       display.setTextSize(1);
       display.setCursor(0, 0);
@@ -589,15 +814,35 @@ void loop() {
       display.print("Alarm: ");
       display.println(alarmEnabled ? "On" : "Off");
       display.print(mainMenuIndex == 1 ? "> " : "  ");
-      display.println("Set Alarm");
+      display.println("View Alarm");
       display.print(mainMenuIndex == 2 ? "> " : "  ");
-      display.println("Set Smart Alarm");
+      display.println("Set Alarm");
       display.print(mainMenuIndex == 3 ? "> " : "  ");
+      display.println("Set Alarm Type");
+      display.print(mainMenuIndex == 4 ? "> " : "  ");
       display.println("System Settings");
+    } else if (currentScreen == Screen::ViewAlarm) {
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println("Current Alarm");
+      display.setCursor(0, 16);
+      char alarmStr[12];
+      snprintf(alarmStr, sizeof(alarmStr), "%02u:%02u", 
+               alarmTime.Hour(), alarmTime.Minute());
+      DrawCenteredText(alarmStr, 25, 2);
+      const char *typeStr;
+      if (alarmType == 0) {
+        typeStr = "Normal Alarm";
+      } else if (alarmType == 1) {
+        typeStr = "Max Sleep Mode";
+      } else {
+        typeStr = "Smart Sleep Mode";
+      }
+      DrawCenteredText(typeStr, 45, 1);
     } else if (currentScreen == Screen::SetAlarm) {
       display.setTextSize(1);
       display.setCursor(0, 0);
-      display.println("Set Alarm");
+      display.println("Set Alarm Time");
       display.setCursor(0, 16);
       char dateStr[12];
       snprintf(dateStr, sizeof(dateStr), "%04u-%02u-%02u",
@@ -607,6 +852,12 @@ void loop() {
       char timeStr[10];
       snprintf(timeStr, sizeof(timeStr), "%02u:%02u", alarmHour, alarmMinute);
       display.println(timeStr);
+      display.setCursor(0, 36);
+      display.print("Now: ");
+      char nowStr[10];
+      snprintf(nowStr, sizeof(nowStr), "%02u:%02u",
+               now.Hour(), now.Minute());
+      display.println(nowStr);
       bool blinkOn = ((nowMs / 400) % 2) == 0;
       if (blinkOn) {
         const int charW = 6;
@@ -616,32 +867,63 @@ void loop() {
         int w = 0;
         int h = charH + 2;
         if (setAlarmFieldIndex == 0) {
-          x = 0;
-          y = 15;
-          w = 4 * charW;
+          x = 0; y = 15; w = 4 * charW;
         } else if (setAlarmFieldIndex == 1) {
-          x = 5 * charW;
-          y = 15;
-          w = 2 * charW;
+          x = 5 * charW; y = 15; w = 2 * charW;
         } else if (setAlarmFieldIndex == 2) {
-          x = 8 * charW;
-          y = 15;
-          w = 2 * charW;
+          x = 8 * charW; y = 15; w = 2 * charW;
         } else if (setAlarmFieldIndex == 3) {
-          x = 0;
-          y = 25;
-          w = 2 * charW;
+          x = 0; y = 25; w = 2 * charW;
         } else {
-          x = 3 * charW;
-          y = 25;
-          w = 2 * charW;
+          x = 3 * charW; y = 25; w = 2 * charW;
         }
         display.drawRect(x - 1, y - 1, w + 2, h, SSD1306_WHITE);
       }
+    } else if (currentScreen == Screen::SetAlarmType) {
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println("Set Alarm Type");
+      display.setCursor(0, 16);
+      display.print(setAlarmTypeIndex == 0 ? "> " : "  ");
+      display.println("Normal Alarm");
+      display.print(setAlarmTypeIndex == 1 ? "> " : "  ");
+      display.println("Max Sleep Mode");
+      display.print(setAlarmTypeIndex == 2 ? "> " : "  ");
+      display.println("Smart Sleep Mode");
+      
+      if (showAlarmTypeInfo) {
+        display.setCursor(0, 45);
+        if (setAlarmTypeIndex == 0) {
+          display.println("Sounds at set");
+          display.println("time only");
+        } else if (setAlarmTypeIndex == 1) {
+          display.println("Wakes before deep");
+          display.println("sleep (< 1 cycle)");
+        } else {
+          display.println("Wakes before deep");
+          display.println("sleep or timer end");
+        }
+      }
     } else if (currentScreen == Screen::SmartAlarm) {
       display.setTextSize(1);
-      DrawCenteredText("Smart Alarm", 0, 1);
-      DrawCenteredText("(placeholder)", 20, 1);
+      display.setCursor(0, 0);
+      display.println("Smart Alarm");
+      display.setCursor(0, 16);
+      display.print(smartAlarmMenuIndex == 0 ? "> " : "  ");
+      display.println("Max Sleep");
+      display.print(smartAlarmMenuIndex == 1 ? "> " : "  ");
+      display.println("Smart Sleep");
+      
+      if (showSmartAlarmInfo) {
+        display.setCursor(0, 35);
+        if (smartAlarmMenuIndex == 0) {
+          display.println("Wakes before deep");
+          display.println("sleep (< 1 cycle)");
+        } else {
+          display.println("Wakes before deep");
+          display.println("sleep or timer end");
+        }
+      }
     } else if (currentScreen == Screen::SystemSettingsMenu) {
       display.setTextSize(1);
       display.setCursor(0, 0);
@@ -650,7 +932,35 @@ void loop() {
       display.print(systemMenuIndex == 0 ? "> " : "  ");
       display.println("Select Tone");
       display.print(systemMenuIndex == 1 ? "> " : "  ");
-      display.println("Placeholder");
+      display.println("Alarm Output");
+      display.print(systemMenuIndex == 2 ? "> " : "  ");
+      display.println("Test Output");
+    } else if (currentScreen == Screen::AlarmOutput) {
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println("Alarm Output");
+      display.setCursor(0, 16);
+      display.print(alarmOutputIndex == 0 ? "> " : "  ");
+      display.println("Vibration");
+      display.print(alarmOutputIndex == 1 ? "> " : "  ");
+      display.println("Speaker");
+      display.print(alarmOutputIndex == 2 ? "> " : "  ");
+      display.println("Both");
+    } else if (currentScreen == Screen::TestAlarmOutput) {
+      display.setTextSize(1);
+      DrawCenteredText("Test Alarm Output", 0, 1);
+      const char *outputStr = "Testing: Vibration";
+      if (alarmOutput == 1) {
+        outputStr = "Testing: Speaker";
+      } else if (alarmOutput == 2) {
+        outputStr = "Testing: Both";
+      }
+      DrawCenteredText(outputStr, 20, 1);
+      if (testAlarmPlaying) {
+        DrawCenteredText("Playing...", 35, 1);
+      } else {
+        DrawCenteredText("Press Right to Test", 35, 1);
+      }
     } else if (currentScreen == Screen::SystemTone) {
       display.setTextSize(1);
       display.setCursor(0, 0);
