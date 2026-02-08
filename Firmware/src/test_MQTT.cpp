@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // MUST define buffer size BEFORE including PubSubClient
 // 500 samples * 6 chars + overhead = ~3524 bytes, use 4096 for safety
@@ -8,6 +10,14 @@
 
 #include <PubSubClient.h>
 #include "MAX30105.h"
+
+// OLED display configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 MAX30105 particleSensor;
 
@@ -22,11 +32,15 @@ WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 // I2C pins for ESP32
-#define SDA_PIN 32
-#define SCL_PIN 33
+#define SDA_PIN 21
+#define SCL_PIN 22
 
 // Vibration motor pin
-#define MOTOR_PIN 27
+#define MOTOR_PIN 25
+
+// Joystick pins (ADC1 compatible with WiFi)
+const int joystickPinX = 32;  // ADC1_CH4
+const int joystickPinY = 35;  // ADC1_CH7
 
 // Control flags
 bool stopSampling = false;  // Set to true when backend sends STOP_SAMPLING
@@ -37,19 +51,64 @@ const uint16_t kWindowSeconds = 10;  // Collect for 10 seconds
 const uint16_t kSamplesPerWindow = kSampleRateHz * kWindowSeconds;  // 500 samples
 const uint16_t kSampleDelayMs = 1000 / kSampleRateHz;
 
-// Function to buzz vibration motor
+// Function to read joystick and check for down press
+bool isJoystickDown() {
+  int y = analogRead(joystickPinY);
+  return (y < 50);  // Down position
+}
+
+// Function to buzz vibration motor with OLED snooze display
 void buzzMotor() {
   Serial.println("📳 Vibration motor activated!");
   
-  // Buzz pattern: 5
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(MOTOR_PIN, HIGH);  // Motor ON
-    delay(2000);
-    digitalWrite(MOTOR_PIN, LOW);   // Motor OFF
-    delay(1000);
+  // Clear display and show SNOOZE button
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 10);
+  display.println("ALARM!");
+  
+  display.setTextSize(2);
+  display.setCursor(15, 45);
+  display.println("SNOOZE");
+  display.drawRect(10, 40, 108, 20, SSD1306_WHITE);
+  display.display();
+  
+  // Start vibration
+  digitalWrite(MOTOR_PIN, HIGH);
+  
+  // Keep vibrating until user presses down on joystick
+  unsigned long lastToggle = millis();
+  bool motorOn = true;
+  
+  while (!isJoystickDown()) {
+    // Pulse vibration (1 second on, 0.5 seconds off)
+    if (millis() - lastToggle > (motorOn ? 1000 : 500)) {
+      motorOn = !motorOn;
+      digitalWrite(MOTOR_PIN, motorOn ? HIGH : LOW);
+      lastToggle = millis();
+    }
+    
+    mqttClient.loop();  // Keep MQTT alive
+    delay(10);
   }
   
-  Serial.println("📳 Vibration complete");
+  // User pressed snooze - stop motor
+  digitalWrite(MOTOR_PIN, LOW);
+  
+  // Show "Snoozed" message
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(20, 25);
+  display.println("Snoozed!");
+  display.display();
+  delay(2000);
+  
+  // Clear display
+  display.clearDisplay();
+  display.display();
+  
+  Serial.println("📳 Alarm snoozed by user");
 }
 
 // Callback function for incoming MQTT messages
@@ -91,7 +150,14 @@ void setup() {
   // Setup vibration motor pin
   pinMode(MOTOR_PIN, OUTPUT);
   digitalWrite(MOTOR_PIN, LOW);  // Make sure motor starts OFF
-  Serial.println("📳 Vibration motor initialized on pin 27");
+  Serial.println("📳 Vibration motor initialized on pin 25");
+  
+  // Setup joystick pins
+  pinMode(joystickPinX, INPUT);
+  pinMode(joystickPinY, INPUT);
+  analogSetAttenuation(ADC_11db);  // Full 0-3.3V range
+  analogReadResolution(12);         // 12-bit resolution (0-4095)
+  Serial.println("🕹️ Joystick initialized");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(kWifiSsid, kWifiPass);
@@ -110,6 +176,21 @@ void setup() {
 
   // Initialize I2C
   Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("SSD1306 allocation failed");
+  } else {
+    Serial.println("OLED display initialized!");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Happy Nappy");
+    display.println("Init...");
+    display.display();
+    delay(1000);
+  }
 
   // Initialize sensor
   if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {

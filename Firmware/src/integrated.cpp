@@ -31,7 +31,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 const char *kWifiSsid = "TP-LINK_26FE";
 const char *kWifiPass = "67147526";
 
-const char *kMqttHost = "192.168.0.105"; //192.168.0.102
+const char *kMqttHost = "192.168.0.102"; //192.168.0.102 //192.168.0.105
 const uint16_t kMqttPort = 1883;
 const char *kMqttTopic = "sensors/max30102/data";
 
