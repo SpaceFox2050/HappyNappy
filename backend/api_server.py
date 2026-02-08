@@ -1,4 +1,5 @@
 import json
+import math
 from datetime import datetime
 import numpy as np
 import heartpy as hp
@@ -73,7 +74,7 @@ async def on_message(client, topic, payload, qos, properties):
             
             # Step 4: Check signal quality before processing
             avg_ir = sum(ir_data) / len(ir_data)
-            if avg_ir < 10000:
+            if avg_ir < 900:
                 print(f"   ⚠️ Poor contact (avg IR: {avg_ir:.0f}) - skipping analysis")
             else: 
                 try:
@@ -89,16 +90,20 @@ async def on_message(client, topic, payload, qos, properties):
                     current_bpm = m['bpm']
                     print(f"   💓 Calculated BPM: {current_bpm:.2f}")
                     
-                    # Store BPM with timestamp
+                    # Store BPM with timestamp (only if valid)
                     global start_time, baseline_bpm, awake, sleep_stage, demo_triggered
                     if start_time is None:
                         start_time = datetime.now()
                     
-                    elapsed_seconds = (datetime.now() - start_time).total_seconds()
-                    bpm_history.append({
-                        "time": elapsed_seconds,
-                        "bpm": round(current_bpm, 2)
-                    })
+                    # Validate BPM is a finite number (not nan, inf, -inf)
+                    if math.isfinite(current_bpm):
+                        elapsed_seconds = (datetime.now() - start_time).total_seconds()
+                        bpm_history.append({
+                            "time": elapsed_seconds,
+                            "bpm": round(current_bpm, 2)
+                        })
+                    else:
+                        print(f"   ⚠️ Invalid BPM value ({current_bpm}) - skipping")
                     
                     # === DEMO MODE: Trigger alarm on first reading ===
                     if awake and not demo_triggered:
