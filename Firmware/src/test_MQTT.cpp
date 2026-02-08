@@ -1,6 +1,11 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+
+// MUST define buffer size BEFORE including PubSubClient
+// 500 samples * 6 chars + overhead = ~3524 bytes, use 4096 for safety
+#define MQTT_MAX_PACKET_SIZE 4096
+
 #include <PubSubClient.h>
 #include "MAX30105.h"
 
@@ -19,6 +24,12 @@ PubSubClient mqttClient(wifiClient);
 // I2C pins for ESP32
 #define SDA_PIN 32
 #define SCL_PIN 33
+
+// Sampling configuration
+const uint16_t kSampleRateHz = 50;  // 50 Hz => 20 ms per sample
+const uint16_t kWindowSeconds = 10;  // Collect for 10 seconds
+const uint16_t kSamplesPerWindow = kSampleRateHz * kWindowSeconds;  // 500 samples
+const uint16_t kSampleDelayMs = 1000 / kSampleRateHz;
 
 void setup() {
   delay(2000);  // Wait for serial monitor to connect
@@ -41,6 +52,7 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   mqttClient.setServer(kMqttHost, kMqttPort);
+  mqttClient.setBufferSize(4096);  // Explicitly set buffer size
 
   // Initialize I2C
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -61,6 +73,9 @@ void setup() {
 
   Serial.println("Sensor configured. Ready to read...");
   Serial.println("Place your finger on the sensor...");
+
+  Serial.print("Free heap: ");
+  Serial.println(ESP.getFreeHeap());
 }
 
 void loop() {
@@ -79,31 +94,39 @@ void loop() {
   }
   mqttClient.loop();
 
-  // Read sensor values
+  // Collect samples for HeartPy analysis
+  static uint16_t sampleIndex = 0;
+  static long irSamples[kSamplesPerWindow];
+
   long irValue = particleSensor.getIR();
-  long redValue = particleSensor.getRed();
-  long greenValue = particleSensor.getGreen();
+  irSamples[sampleIndex++] = irValue;
 
-  // Print data to Serial Monitor
-  Serial.print("IR: ");
-  Serial.print(irValue);
-  Serial.print(" | Red: ");
-  Serial.print(redValue);
-  Serial.print(" | Green: ");
-  Serial.println(greenValue);
+  if (sampleIndex >= kSamplesPerWindow) {
+    String payload;
+    payload.reserve(3600);
+    payload += "{\"ir\":[";
+    for (uint16_t i = 0; i < kSamplesPerWindow; ++i) {
+      payload += String(irSamples[i]);
+      if (i + 1 < kSamplesPerWindow) {
+        payload += ',';
+      }
+    }
+    payload += "],\"sample_rate\":";
+    payload += String(kSampleRateHz);
+    payload += '}';
 
-  // Check if finger is detected (IR value > 50000 typically means finger present)
-  if (irValue > 15000) {
-    Serial.println(">> Finger detected!");
-  } else {
-    Serial.println(">> No finger detected");
+    bool success = mqttClient.publish(kMqttTopic, payload.c_str());
+    
+    if (success) {
+      Serial.print("✅ Published ");
+      Serial.print(kSamplesPerWindow);
+      Serial.println("-sample window successfully");
+    } else {
+      Serial.println("❌ Publish FAILED");
+    }
+
+    sampleIndex = 0;
   }
 
-  char payload[128];
-  snprintf(payload, sizeof(payload),
-           "{\"ir\":%ld,\"red\":%ld,\"green\":%ld,\"finger\":%s}",
-           irValue, redValue, greenValue, (irValue > 15000) ? "true" : "false");
-  mqttClient.publish(kMqttTopic, payload);
-
-  delay(500);  // Read every 100ms
+  delay(kSampleDelayMs);
 }
